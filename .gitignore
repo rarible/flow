@@ -10,3 +10,8 @@
 # Gradle temp files
 protobuf/.gradle
 protobuf/build
+
+# python files
+venv
+**/*.pyc
+**/*.pyc
