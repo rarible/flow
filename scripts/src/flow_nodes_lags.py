@@ -50,11 +50,11 @@ async def get_transactions_by_block_id(api: AccessAPIStub, block_id):
     return [event for res in resp.transaction_results for event in res.events]
 
 
-async def _get_block(api, handler, undoc=False):
+async def _get_block(api, handler, undoc):
     try:
         resp: BlockResponse = await handler()
         if resp is None or resp.block_status != BLOCK_SEALED:
-            return None
+            return None, None
         if undoc:
             transactions = await get_transactions_by_block_id(api, resp.block.id)
         else:
@@ -62,39 +62,39 @@ async def _get_block(api, handler, undoc=False):
             transactions = await asyncio.gather(*[transactions_by_collection_id(api, collection_id)
                                                   for collection_id in collection_ids])
             transactions = list(itertools.chain(*transactions))
-        return BlockWithTransactions(resp.block, resp.block_status, transactions)
+        return BlockWithTransactions(resp.block, resp.block_status, transactions), None
     except AioRpcError as e:
         if e.code() == grpc.StatusCode.NOT_FOUND:
-            return None
+            return None, e.details()
         else:
             raise e
 
 
-async def get_block_by_id(api: AccessAPIStub, id, undoc=False):
+async def get_block_by_id(api: AccessAPIStub, id, undoc):
     async def handler():
         return await api.GetBlockByID(GetBlockByIDRequest(id=id))
 
     return await _get_block(api, handler, undoc)
 
 
-async def get_block_by_height(api, height, undoc=False):
+async def get_block_by_height(api, height, undoc):
     async def handler():
         return await api.GetBlockByHeight(GetBlockByHeightRequest(height=height))
 
     return await _get_block(api, handler, undoc)
 
 
-async def get_latest_block(api, undoc=False):
+async def get_latest_block(api, undoc):
     async def handler():
         return await api.GetLatestBlock(GetLatestBlockRequest(is_sealed=True))
 
     return await _get_block(api, handler, undoc)
 
 
-async def wait_until_block(api, height, undoc=False):
+async def wait_until_block(api, height, undoc):
     start = time.perf_counter()
     while True:
-        resp: BlockWithTransactions = await get_block_by_height(api, height, undoc)
+        resp, err = await get_block_by_height(api, height, undoc)
         if resp is not None:
             return resp, 1000 * (time.perf_counter() - start)
 
@@ -115,23 +115,27 @@ def print_stats(native_ms, quicknode_ms):
 async def compare_nodes_parallel():
     native_api = access_pb2_grpc.AccessAPIStub(grpc.aio.insecure_channel(onflow_access_url))
     quicknode_api = access_pb2_grpc.AccessAPIStub(grpc.aio.insecure_channel(quicknode_access_url))
-    last_height = (await native_api.GetLatestBlock(GetLatestBlockRequest(is_sealed=True,
-                                                                         full_block_response=True))).block.height
+    next_height = (await native_api.GetLatestBlock(GetLatestBlockRequest(is_sealed=True,
+                                                                         full_block_response=True))).block.height + 1
     native_ms = []
     quicknode_ms = []
     while True:
-        t1 = asyncio.create_task(wait_until_block(native_api, last_height + 1, undoc=True))
-        t2 = asyncio.create_task(wait_until_block(quicknode_api, last_height + 1, undoc=True))
-        native_block, native_elapsed = await t1
-        quiknode_block, quicknode_elapsed = await t2
-        if native_block == quiknode_block:
+        t1 = asyncio.create_task(wait_until_block(native_api, next_height, undoc=True))
+        t2 = asyncio.create_task(wait_until_block(quicknode_api, next_height, undoc=True))
+        ((native_block, native_elapsed), (quiknode_block, quicknode_elapsed)) = await asyncio.gather(t1, t2)
+        if native_block.transactions != quiknode_block.transactions:
+            log.warning(f"transactions don't match for height {next_height} "
+                        f"native_txs={len(native_block.transactions)}, "
+                        f"quicknode_txs={len(quiknode_block.transactions)}")
+            next_height += 1
+        else:
             native_ms.append(native_elapsed)
             quicknode_ms.append(quicknode_elapsed)
-            print(f"{last_height}: "
+            print(f"{next_height}: "
                   f"native={native_elapsed:.2f}, quicknode={quicknode_elapsed:.2f} "
                   f"diff={native_elapsed - quicknode_elapsed :.2f}ms")
-            last_height += 1
-            if last_height % 1000 == 0:
+            next_height += 1
+            if next_height % 20 == 0:
                 print_stats(native_ms, quicknode_ms)
                 native_ms = []
                 quicknode_ms = []
@@ -149,9 +153,12 @@ async def compare_nodes(poller_node_url, sync_node_url, poller_node_undoc, sync_
         synced = False
         start = None
         while not synced:
-            block = await get_block_by_id(sync_node_api, poller_block.block.id, undoc=sync_node_undoc)
+            block, err = await get_block_by_id(sync_node_api, poller_block.block.id, undoc=sync_node_undoc)
             if block is None:
-                log.warning(f"sync: missing block {poller_block.block.height}")
+                if log.isEnabledFor(logging.DEBUG):
+                    log.warning(f"sync: missing block {poller_block.block.height}, details {err}")
+                else:
+                    log.warning(f"sync: missing block {poller_block.block.height}")
                 if start is None:
                     start = time.perf_counter()
             elif poller_block.transactions != block.transactions:
@@ -174,10 +181,12 @@ async def compare_nodes(poller_node_url, sync_node_url, poller_node_undoc, sync_
                     start = None
 
     async def poller():
-        init_block_height = (await get_latest_block(poller_node_api)).block.height
+        latest_block, err = await get_latest_block(poller_node_api, undoc=poller_node_undoc)
+        init_block_height = latest_block.block.height
         last_block_height = init_block_height
         while last_block_height - init_block_height < 1000:
-            latest_block = await get_block_by_height(poller_node_api, last_block_height + 1, undoc=poller_node_undoc)
+            latest_block, err = await get_block_by_height(poller_node_api, last_block_height + 1,
+                                                          undoc=poller_node_undoc)
             if latest_block is None:
                 continue
             log.info(f"poller: new block {latest_block.block.height}")
@@ -246,18 +255,18 @@ if __name__ == '__main__':
     #
     # 2. Poller: onflow, sync: quicknode
     # delayed block stat:
-    # stats: min=316.59, max=3748.11, mean=926.73, size=107/1000
-    # stats: mismatch_txs=75/1000
-    # In this test all mismatch txs have "poller has more transactions: True, blocks statuses match: True", in other words
-    # poller always provide more txs than sync node, but after several calls sync node returns same txs
+    # stats: min=368.02, max=4451.49, mean=1075.98, size=112/1000
+    # stats: mismatch_txs=81/1000
+    # poller_node_undoc=True - effectively the same mismatch txs
     # asyncio.run(compare_nodes(poller_node_url=onflow_access_url,
     #                           sync_node_url=quicknode_access_url,
-    #                           poller_node_undoc=True,
+    #                           poller_node_undoc=False,
     #                           sync_node_undoc=False))
     #
     # delayed block stat:
-    # stats: min=217.36, max=1176.78, mean=371.02, size=64/1000
-    # stats: mismatch_txs=0
+    # stats: min=247.23, max=2089.68, mean=624.48, size=66/1000
+    # stats: mismatch_txs=0/1000
+    # poller_node_undoc=False - effectively the same mismatch txs
     # asyncio.run(compare_nodes(poller_node_url=onflow_access_url,
     #                           sync_node_url=quicknode_access_url,
     #                           poller_node_undoc=True,
@@ -266,41 +275,20 @@ if __name__ == '__main__':
     # 3. Poller: quicknode, sync: flow
     #
     # delayed block stat:
-    # stats: min=352.55, max=10991.97, mean=2730.01, size=29/1000
-    # stats: mismatch_txs=137/1000
+    # stats: min=384.21, max=7877.30, mean=2596.40, size=34/1000
+    # stats: mismatch_txs=97/1000
+    # sync_node_undoc=True - effectively the same mismatch txs
     # asyncio.run(compare_nodes(poller_node_url=quicknode_access_url,
     #                           sync_node_url=onflow_access_url,
     #                           poller_node_undoc=False,
     #                           sync_node_undoc=False))
     #
     # delayed block stat:
-    # stats: min=230.87, max=15838.18, mean=2535.99, size=94/1000
+    # stats: min=225.22, max=6969.85, mean=1922.84, size=53
     # stats: mismatch_txs=0
+    # sync_node_undoc=False - effectively the same mismatch txs
     # asyncio.run(compare_nodes(poller_node_url=quicknode_access_url,
     #                           sync_node_url=onflow_access_url,
     #                           poller_node_undoc=True,
     #                           sync_node_undoc=True))
-    #
-    # delayed block stat:
-    # stats:
-    # stats:
-    asyncio.run(compare_nodes(poller_node_url=quicknode_access_url,
-                              sync_node_url=onflow_access_url,
-                              poller_node_undoc=True,
-                              sync_node_undoc=False))
-    #
-    # delayed block stat:
-    # stats: min=348.14, max=10246.50, mean=2517.67, size=75
-    # stats: mismatch_txs=0
-    asyncio.run(compare_nodes(poller_node_url=quicknode_access_url,
-                              sync_node_url=onflow_access_url,
-                              poller_node_undoc=False,
-                              sync_node_undoc=True))
-    #
-    # delayed block stat:
-    # stats: min=345.47, max=23014.31, mean=4855.89, size=149
-    # stats:  mismatch_txs=0
-    asyncio.run(compare_nodes(poller_node_url=quicknode_access_url,
-                              sync_node_url=onflow_access_url,
-                              poller_node_undoc=True,
-                              sync_node_undoc=False))
+    pass

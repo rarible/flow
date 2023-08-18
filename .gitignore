@@ -14,4 +14,3 @@ protobuf/build
 # python files
 venv
 **/*.pyc
-**/*.pyc
