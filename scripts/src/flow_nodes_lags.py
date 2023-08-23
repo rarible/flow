@@ -162,10 +162,16 @@ async def compare_nodes(poller_node_url, sync_node_url, poller_node_undoc, sync_
                 if start is None:
                     start = time.perf_counter()
             elif poller_block.transactions != block.transactions:
-                log.warning(f"sync: txs don't match for {poller_block.block.height}, "
-                            f"poller has more transactions: {len(poller_block.transactions) > len(block.transactions)}, "
-                            f"blocks statuses match: {poller_block.block_status == block.block_status}")
-
+                # dict.fromkeys used to keep tx order
+                poller_txs = list(dict.fromkeys(t.transaction_id for t in poller_block.transactions))
+                sync_txs = list(dict.fromkeys(t.transaction_id for t in block.transactions))
+                log.warning(f"sync: txs don't match for {poller_block.block.height}: \n"
+                            f"\tpoller has more transactions: {len(poller_block.transactions) > len(block.transactions)}, "
+                            f"\tblocks statuses match: {poller_block.block_status == block.block_status},\n"
+                            f"\tpoller txs (size={len(poller_txs)}): \t{poller_txs}\n"
+                            f"\tsync txs (size={len(sync_txs)}): \t{sync_txs}\n"
+                            f"\tpoller extra txs: {set(poller_txs).difference(set(sync_txs))}\n"
+                            f"\tsync extra txs: {set(sync_txs).difference(set(poller_txs))}")
                 mismatch_txs.add(poller_block.block.height)
                 if len(poller_block.transactions) < len(block.transactions):
                     # infinite loop
@@ -235,10 +241,10 @@ if __name__ == '__main__':
     # poller_node_undoc=False, sync_node_undoc=True - effectively the same
     # poller_node_undoc=True, sync_node_undoc=False - has mismatch txs but always with "poller has more transactions: True",
     # so at second call (or at one of the following calls) it synced
-    # asyncio.run(compare_nodes(poller_node_url=quicknode_access_url,
-    #                           sync_node_url=quicknode_access_url,
-    #                           poller_node_undoc=False,
-    #                           sync_node_undoc=False))
+    asyncio.run(compare_nodes(poller_node_url=quicknode_access_url,
+                              sync_node_url=quicknode_access_url,
+                              poller_node_undoc=False,
+                              sync_node_undoc=False))
     #
     # has missing blocks delay, no mismatch txs
     # stats: min=217.26, max=1624.48, mean=419.81, size=102/1000
