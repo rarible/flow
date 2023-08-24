@@ -78,9 +78,9 @@ publishing {
             credentials.password = System.getenv("NEXUS_PASSWORD")
 
             if (project.version.toString().endsWith("-SNAPSHOT")) {
-                url = uri("http://nexus.rarible.int/repository/maven-snapshots/")
+                url = uri("http://nexus-ext.rarible.int/repository/maven-snapshots/")
             } else {
-                url = uri("http://nexus.rarible.int/repository/maven-releases/")
+                url = uri("http://nexus-ext.rarible.int/repository/maven-releases/")
             }
         }
     }
